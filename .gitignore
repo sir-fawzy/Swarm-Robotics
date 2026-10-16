@@ -1,0 +1,7 @@
+bin/
+obj/
+**/bin/
+**/obj/
+*.key
+*.pfx
+*.secrets.json
