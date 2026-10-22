@@ -1,5 +1,19 @@
 # Security model and limitations
 
+## Distributed mode (default)
+
+The default application now runs a single-process simulation of independent all-to-all robot nodes. It uses a limited single-view proposal/prepare/commit agreement protocol. This is experimental, not production security or full PBFT. See [DISTRIBUTED_DESIGN.md](DISTRIBUTED_DESIGN.md) for transitions, the quorum safety argument, and omitted features.
+
+Trusted admission supplies a fixed common roster of P-256 public keys. Nodes receive only their own private signing capability and independent public-only verifiers. A valid key does not grant membership. The session ID, roster fingerprint (including fault bound), round, message kind, IDs, UTC timestamp, digest, and embedded signed readings are authenticated using deterministic versioned payloads. ECDSA P-256/SHA-256 signatures replace shared-secret verification for peer-to-peer messages. Keys are random, memory-only, and never logged or persisted by the application.
+
+Setup requires `n >= 3f + 1`, with `n - f` distinct prepare votes and `n - f` distinct commit votes. Honest nodes lock one proposal per session/round and commit only after a prepare quorum. At most `f` admitted Byzantine peers and secure signatures are assumptions of the nonconflicting-decision argument. There is no within-round view change, so a faulty proposer can prevent completion. Partitions can leave some nodes undecided. Agreement does not prove sensor accuracy, and admission does not prove physical robot uniqueness.
+
+Each node validates fields and signatures before consuming accepted-message replay state or per-kind sender allowances. All packets, including invalid ones, count toward its incoming-work limit. Default limits are 4,096 examined packets per node/round, 65,536 bytes per packet, and 8,192 pending transport packets. Proposal verification can require up to `n + 1` signature checks. Floods can exhaust limits and deny service; no fairness guarantee is claimed. Logs can grow over multiple rounds.
+
+There is no durable replay state, key management service, node recovery, state transfer, or real robot transport. Fresh sessions prevent reusing old-session packets in the demo; recovering a previous session after a crash is not supported. Local logs/certificates are inspectable evidence, not a replicated blockchain. All nodes run sequentially in one process, which is not isolation against arbitrary code execution.
+
+## Centralized comparison (`--centralized`)
+
 This is a centralized batch aggregator for swarm experiments, not distributed consensus, a blockchain protocol, or production security.
 
 Trusted startup code provisions a fresh random 256-bit HMAC-SHA256 key for each identity. Keys remain in process memory, are never printed or persisted, and change on restart. Each robot gets only its own signing capability. The attacker receives only its own fake identity capabilities. The trusted authority retains verification keys; HMAC verifiers can forge messages, so this is not a public digital signature system. In-process capability separation is an architectural boundary, not isolation from arbitrary code execution or reflection.

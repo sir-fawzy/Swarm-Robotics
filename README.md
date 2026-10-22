@@ -1,17 +1,16 @@
 # SwarmSecureCoordination
 
-A C# simulation for exploring how authentication, identity admission, replay protection, message budgets, and simple filtering affect a swarm's shared estimate when some senders are faulty or malicious.
+A C# simulation for studying swarm agreement under faulty sensor readings, replay, tampering, fake identities, conflicting proposals, and communication failures.
 
-The central question is: **How does a protected aggregation pipeline compare with an unprotected average when robots send incorrect readings or an attacker submits messages through fake identities?**
+The default mode models **independent robot nodes communicating over an all-to-all network**. Each node checks messages, keeps its own state, exchanges votes, calculates an estimate, and decides locally. The earlier centralized model remains available as a comparison.
 
-The current implementation runs locally in one process. Its “consensus” result is a centralized aggregate of sensor readings. It does not implement distributed agreement, a blockchain network, or a production security system.
+This is a single-process distributed-protocol simulation, not deployment software for physical robots or a production implementation of Byzantine fault tolerance.
 
 ## Requirements and quick start
 
-- .NET 10 SDK, matching the project's `net10.0` target.
-- Access to NuGet when restoring the test dependencies for the first time.
+Use the .NET 10 SDK. The first test dependency restore requires access to NuGet.
 
-From the `SwarmSecureCoordination` project directory, run:
+Run these commands from the project directory:
 
 ```sh
 dotnet build SwarmSecureCoordination.sln
@@ -19,9 +18,106 @@ dotnet test SwarmSecureCoordination.sln
 dotnet run --project SwarmSecureCoordination.csproj
 ```
 
-The application prints a baseline and a secure result for each of four simulation runs. Honest readings include random noise, so results vary between executions. A missing result is displayed as `no consensus`; it is never replaced with zero.
+The default runs distributed experiments. You can select either mode explicitly:
 
-## Project layout
+```sh
+dotnet run --project SwarmSecureCoordination.csproj -- --distributed
+dotnet run --project SwarmSecureCoordination.csproj -- --centralized
+```
+
+## Distributed agreement model
+
+The implementation uses a **single-view, quorum-based proposal/prepare/commit protocol**, informed by [Castro and Liskov's PBFT work](https://www.usenix.org/conference/osdi-99/presentation/practical-byzantine-fault-tolerance). It is not full PBFT: it has no view-change protocol, checkpoint transfer, recovery, or general replicated state machine.
+
+The roster is fixed and trusted for a session. For `n` admitted robots and a configured bound of `f` Byzantine robots, setup requires `n >= 3f + 1`; a quorum contains `n - f` distinct admitted identities. The demonstration uses four admitted robots, a fault bound of one, and quorums of three.
+
+### How robots decide
+
+1. Trusted setup gives every robot its own ECDSA P-256 private signing capability and a copy of the roster containing public keys only. A fresh session ID and the roster fingerprint bind all messages to that experiment.
+2. Each robot broadcasts one signed sensor reading for the round.
+3. After the reading-collection window, the designated proposer suggests a sorted vector of at least `n - f` distinct, independently signed readings. The proposer rotates by round number.
+4. Each recipient validates the proposer, the entire vector, and every reading signature. It locks one valid proposal for that round and broadcasts a signed **prepare** vote for its digest.
+5. A node that gathers `n - f` matching prepare votes broadcasts a signed **commit** vote.
+6. A node decides only after it has its own matching prepare quorum and `n - f` matching commit votes. It calculates the trimmed mean itself and records the local result and certificate.
+
+The proposer cannot establish a decision alone. The network scheduler never selects a proposal, calculates a result, or fabricates votes.
+
+Two quorums of size `n - f` intersect in at least `n - 2f > f` members. Under the stated fault bound, that intersection includes an honest robot, which never prepares two proposals for the same session and round. This is the basis for rejecting conflicting decisions in this limited protocol. Tests exercise the implementation; they do not constitute a formal proof.
+
+### Agreement, participation, and accuracy
+
+- **Agreement safety:** honest nodes that decide should not decide different proposal digests for the same session, roster, and round.
+- **Completion:** enough messages and votes must arrive before the simulation closes the round. An honest proposer and timely delivery are needed for normal progress; a faulty or unavailable proposer can stall the round.
+- **Accuracy:** honest nodes may agree on a bad physical estimate. A signature authenticates who supplied a reading, not whether the sensor value is true.
+
+A proposal may omit up to `f` members' readings. Membership validation does not force the proposer to include every honest reading. The fixed estimation policy sorts the accepted vector, removes one minimum and one maximum when there are more than two readings, and averages the rest. This policy is shared by the protocol version and is not a general Byzantine estimation guarantee.
+
+`no decision` means that a node did not collect the required evidence. It is not represented as zero. A result is not labeled successful merely because no conflicting decisions were observed: zero nodes deciding is reported separately from all nodes deciding.
+
+### Distributed source files
+
+| File under `Distributed/` | Purpose |
+| --- | --- |
+| `ProtocolModels.cs` | Defines signed readings, proposal and vote messages, immutable local decision records, and the `INodeSigner`, `IPublicKeyVerifier`, and `IRobotNetwork` contracts. |
+| `ProtocolCodec.cs` | Provides versioned deterministic authentication payloads, proposal digests, strict bounded JSON decoding, and packet serialization. |
+| `NodeIdentity.cs` | Creates an independent random P-256 key per identity. Signing refuses another sender ID. Public-key verifiers import only the roster's public keys. |
+| `SwarmMembership.cs` | Validates the trusted roster, key uniqueness, fault bound, and quorum size; computes a fingerprint; provides the rotating proposer. The simulation supports 1–32 members, subject to the fault bound. |
+| `AgreementNode.cs` | Implements one robot's reading reception, proposal validation, replay checks, per-kind allowances, vote collection, local decision, and local log. |
+| `CommitCertificate.cs` | Independently checks a local decision's signed reading vector, digest, distinct commit quorum, and default estimate using public keys. It does not establish physical sensor truth or verify the local log chain. |
+| `SimulatedNetwork.cs` | Schedules separate deliveries to each registered endpoint. Supports dropped, delayed, duplicated, and reordered packets, queue limits, and delivery metrics. |
+| `DistributedExperiments.cs` | Constructs experiment scenarios, advances simulated time, injects attacker behavior using attacker-owned credentials, and prints each node's result. |
+
+### Message authentication and state
+
+All distributed messages bind their kind, session ID, roster fingerprint, round, sender, message ID, UTC timestamp, proposal digest, and any embedded readings. Every reading separately authenticates its context and exact numeric value. Authentication excludes only the envelope's own signature.
+
+Distributed signatures use ECDSA P-256 with SHA-256 and fixed-width signatures. Centralized HMAC code remains in its separate comparison path. Distributing verification keys therefore gives peers no ability to sign on behalf of other robots.
+
+Each node rejects unadmitted senders, malformed data, nonfinite/out-of-range readings, wrong contexts, invalid signatures, and timestamps more than five minutes old or thirty seconds in the future. Replay IDs are scoped by sender and message kind. Per round, each node accepts at most one reading and one prepare/commit vote per sender and locks at most one proposal. Invalid authentication or proposal contents cannot consume those accepted-message allowances.
+
+Votes may arrive before the corresponding proposal; a node stores at most one vote per sender and kind and counts only those matching its validated proposal. A commit quorum by itself cannot make a node decide without its own prepare quorum.
+
+`BeginRound` requires a strictly newer round and a closed previous round. `CloseRound` is the experiment deadline. The same node instances retain their local decision logs across rounds; per-round replay and vote state resets on advancement. Delayed messages from an older round cannot be counted in a newer one.
+
+Each local log entry contains the decided vector, commit certificate, estimate, and a hash linking the previous local decision to the current proposal digest. A node that missed a decision may have a different local history. There is no automatic state synchronization, durable ledger, or globally agreed log-tip requirement.
+
+### Distributed experiments
+
+| Scenario | Expected behavior under the configured schedule |
+| --- | --- |
+| Honest swarm | All four nodes decide the same vector and estimate. |
+| Faulty sensor | An admitted sender reports 1.0; peers agree, while trimming reduces that particular outlier's influence. |
+| Sybil and replay | An outsider's signed submissions are rejected; repeated proposals and votes do not create extra voting power. |
+| Silent peer | Three reachable honest nodes can still decide without the fourth peer. |
+| Partition | A 2–2 split cannot form a quorum; nodes report no decision. |
+| Equivocating proposer | A faulty proposer sends different vectors to different peers; in this schedule the honest votes split and no honest peer decides. |
+| Flood | Invalid traffic exhausts deliberately reduced incoming allowances; nodes can lose availability and report no decision. |
+
+Output includes per-node decisions, rejected messages, limit drops, how many honest nodes decided, whether decided digests conflict, delivery counts, and estimation error from the experiment's 0.7 reference. The harness knows which peers it modeled as faulty for reporting; that knowledge is not available to the protocol.
+ 
+### Distributed tests
+
+`Tests/DistributedAgreementTests.cs` covers independent decisions and public certificates; false readings; silent peers; unavailable proposers; partitions; delays, reordering, and duplication; insufficient distinct votes; forgery; unauthorized Sybils; envelope and reading tampering; malformed/nonfinite inputs; invalid proposal handling; duplicate-reading identities; equivocation with conflicting votes; missing prepare quorums; round/session replay; flooding; transport limits; membership validation; culture independence; seven-node operation with two silent peers; and several adversarial delivery/lock assignments.
+
+The original eight centralized security regression tests remain in `Tests/SecurityTests.cs`.
+
+### Resource limits and failure assumptions
+
+- The in-memory scheduler has a default pending-queue capacity of 8,192 packets, with at most 65,536 bytes per packet. Delivery is shuffled using a seeded scheduler. Delay and duplicate counts are bounded by the transport API.
+- Each node examines at most 4,096 incoming items per round by default, including its own locally emitted messages. A fully populated proposal can require up to `n + 1` signature checks. Allowances for authenticated senders apply after verification; they cannot eliminate invalid-signature cost.
+- A flood may exhaust queue or incoming limits and prevent honest progress. The protocol does not claim fairness or DoS-proof availability. Ingested packets and verification work are bounded, but local logs can grow across rounds.
+- Timing is controlled by logical network ticks and explicit experiment deadlines. Timestamp freshness uses each node's supplied `TimeProvider`, defaulting to wall-clock UTC. This is not a calibrated radio, mobility, or clock-drift model.
+- Nodes are separate state machines in a single process, driven sequentially by the scheduler. There is no real network transport, OS-process isolation, or physical robot integration.
+- Admission is trusted and static. Public-key possession does not prove one physical robot per identity. Admitting many attacker-controlled identities can violate the configured Byzantine fault bound.
+- There is no within-round leader replacement. Moving to a new round starts a distinct sensor decision; it does not retry or finalize the previous round's value.
+
+See [SECURITY.md](SECURITY.md) for the trust model and [DISTRIBUTED_DESIGN.md](DISTRIBUTED_DESIGN.md) for protocol details and next steps.
+
+---
+
+The remaining sections describe the preserved centralized comparison and its components.
+
+## Centralized comparison: project layout
 
 ```text
 SwarmSecureCoordination/
@@ -70,11 +166,11 @@ SwarmSecureCoordination/
 6. Accepted messages enter the local hash log. Their values pass through the filter and then the averaging module.
 7. The experiment runner returns the result for that batch, or `null` if no values remain.
 
-## Entry point and project files
+## Centralized comparison: entry point and project files
 
-### `Program.cs`
+### `Program.cs` — `--centralized` mode
 
-This is the composition root: it creates the concrete implementations and connects them through their interfaces. It provisions honest and fake signing identities, initializes budgets, creates messages, and prints the experiment results.
+The centralized branch is the composition root: it creates the concrete implementations and connects them through their interfaces. It provisions honest and fake signing identities, initializes budgets, creates messages, and prints the experiment results.
 
 Each loop iteration creates a fresh experiment and processes round 1:
 
@@ -232,7 +328,7 @@ Exposes the two experiment paths: `RunBaselineRound` and `RunSecureRound`. It re
 
 It does not provision identities or initialize round budgets. Trusted calling code must perform that setup before processing messages.
 
-## Tests
+## Centralized regression tests
 
 `Tests/SwarmSecureCoordination.Tests.csproj` references the application and uses xUnit with the .NET test SDK.
 
@@ -261,7 +357,7 @@ These are regression checks for the implemented behavior, not a proof of securit
 
 The console demo is an illustration, not a statistical evaluation. Repeated trials, reproducible randomness, explicit attack assumptions, and metrics would be needed for research comparisons.
 
-## Boundaries and limitations
+## Centralized model boundaries and limitations
 
 - All coordination, keys, replay state, budgets, and logs reside in one process. Restarting loses that state.
 - The trusted authority decides admission; the project does not establish that an identity corresponds to one physical robot.

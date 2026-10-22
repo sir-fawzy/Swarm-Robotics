@@ -1,5 +1,22 @@
 using SwarmSecureCoordination.Core;
 using SwarmSecureCoordination.Security;
+using SwarmSecureCoordination.Distributed;
+
+if (args.Length == 0 || args is ["--distributed"])
+{
+    DistributedExperiments.Run();
+    return;
+}
+if (args is not ["--centralized"])
+{
+    Console.Error.WriteLine("Usage: dotnet run -- [--distributed|--centralized]");
+    Environment.ExitCode = 2;
+    return;
+}
+RunCentralized();
+
+static void RunCentralized()
+{
 for (int scenario = 1; scenario <= 4; scenario++)
 {
     var identities = new IdentityManager();
@@ -18,3 +35,5 @@ for (int scenario = 1; scenario <= 4; scenario++)
     Console.WriteLine($"Scenario {scenario}: baseline={Format(runner.RunBaselineRound(messages))}, secure={Format(runner.RunSecureRound(messages, 1))}");
 }
 static string Format(double? value) => value?.ToString("F4") ?? "no consensus";
+
+}
